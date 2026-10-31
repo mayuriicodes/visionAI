@@ -1,4 +1,7 @@
+import atexit
+import importlib
 import io
+import os
 import sqlite3
 import tempfile
 import unittest
@@ -9,7 +12,45 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 from PIL import Image
 
-from app import main
+_TEST_ENVIRONMENT_KEYS = (
+    "VISIONAI_JWT_SECRET",
+    "VISIONAI_DATABASE_PATH",
+    "TORCH_HOME",
+    "YOLO_CONFIG_DIR",
+)
+_ORIGINAL_TEST_ENVIRONMENT = {
+    key: os.environ.get(key) for key in _TEST_ENVIRONMENT_KEYS
+}
+_TEST_ROOT = tempfile.TemporaryDirectory(prefix="visionai-tests-")
+
+
+def _restore_test_environment() -> None:
+    for key, value in _ORIGINAL_TEST_ENVIRONMENT.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+
+
+def _cleanup_test_environment() -> None:
+    try:
+        _restore_test_environment()
+    finally:
+        _TEST_ROOT.cleanup()
+
+
+atexit.register(_cleanup_test_environment)
+_TEST_ROOT_PATH = Path(_TEST_ROOT.name)
+os.environ["VISIONAI_JWT_SECRET"] = (
+    "visionai-test-only-jwt-secret-not-for-production-2026"
+)
+os.environ["VISIONAI_DATABASE_PATH"] = str(_TEST_ROOT_PATH / "import.sqlite3")
+os.environ["TORCH_HOME"] = str(_TEST_ROOT_PATH / "torch")
+os.environ["YOLO_CONFIG_DIR"] = str(_TEST_ROOT_PATH / "yolo-config")
+
+main = importlib.import_module("app.main")
+main.CLASSIFICATION_IMAGE_DIR = _TEST_ROOT_PATH / "classifications"
+main.DETECTION_IMAGE_DIR = _TEST_ROOT_PATH / "detections"
 
 PREDICTIONS = [
     {"label": "tabby, tabby cat", "confidence": 0.72},
@@ -30,15 +71,29 @@ def image_bytes(
 class ClassificationApiTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
         data_path = Path(self.temporary_directory.name)
         self.original_database_path = main.DATABASE_PATH
         self.original_classification_image_dir = main.CLASSIFICATION_IMAGE_DIR
         self.original_detection_image_dir = main.DETECTION_IMAGE_DIR
+        self.addCleanup(self._restore_application_paths)
         main.DATABASE_PATH = data_path / "test.sqlite3"
         main.CLASSIFICATION_IMAGE_DIR = data_path / "classifications"
         main.DETECTION_IMAGE_DIR = data_path / "detections"
-        self.client = TestClient(main.app)
-        self.client.__enter__()
+        for service in (
+            main.image_classification_service,
+            main.object_detection_service,
+        ):
+            model_loader_guard = patch.object(
+                service,
+                "_get_model",
+                side_effect=AssertionError(
+                    "Backend tests must not load real model weights."
+                ),
+            )
+            model_loader_guard.start()
+            self.addCleanup(model_loader_guard.stop)
+        self.client = self._open_client()
         response = self.client.post(
             "/api/auth/register",
             json={
@@ -49,12 +104,26 @@ class ClassificationApiTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 201)
 
-    def tearDown(self) -> None:
-        self.client.__exit__(None, None, None)
+    def _restore_application_paths(self) -> None:
         main.DATABASE_PATH = self.original_database_path
         main.CLASSIFICATION_IMAGE_DIR = self.original_classification_image_dir
         main.DETECTION_IMAGE_DIR = self.original_detection_image_dir
-        self.temporary_directory.cleanup()
+
+    def _open_client(self) -> TestClient:
+        client = TestClient(main.app)
+        is_open = False
+
+        def close_client() -> None:
+            nonlocal is_open
+            if is_open:
+                is_open = False
+                client.__exit__(None, None, None)
+
+        self.addCleanup(close_client)
+        client.__enter__()
+        is_open = True
+        self._close_client = close_client
+        return client
 
     def upload_classification(self, filename: str = "sample.jpg", data: bytes | None = None):
         return self.client.post(
@@ -154,9 +223,8 @@ class ClassificationApiTests(unittest.TestCase):
             created = self.upload_classification()
         self.assertEqual(created.status_code, 201, created.text)
 
-        self.client.__exit__(None, None, None)
-        self.client = TestClient(main.app)
-        self.client.__enter__()
+        self._close_client()
+        self.client = self._open_client()
         login = self.client.post(
             "/api/auth/login",
             json={"email": "visionai-test@example.com", "password": "test-password-123"},
