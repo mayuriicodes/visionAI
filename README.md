@@ -1,6 +1,6 @@
 # VisionAI
 
-VisionAI is a React + Vite workspace backed by FastAPI. It provides SQLite-backed accounts, secure password hashing, signed JWT sessions in HTTP-only cookies, protected workspace pages, YOLO object detection, and general-purpose ImageNet image classification.
+VisionAI is an AI-powered image classification and object detection web application built with React + Vite and FastAPI. It provides SQLite-backed accounts, secure password hashing, signed JWT sessions in HTTP-only cookies, protected workspace pages, YOLO object detection, and general-purpose ImageNet image classification.
 
 ## Prerequisites
 
